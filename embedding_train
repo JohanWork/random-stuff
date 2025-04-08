@@ -1,0 +1,180 @@
+from datasets import load_dataset
+import torch
+from transformers import AutoTokenizer, AutoModel
+import numpy as np
+
+# Load dataset from the hub
+dataset = load_dataset("philschmid/finanical-rag-embedding-dataset", split="train")
+ 
+# rename columns
+dataset = dataset.rename_column("question", "anchor")
+dataset = dataset.rename_column("context", "positive")
+
+# Create random binary labels (0 or 1)
+random_labels = np.random.randint(0, 2, size=len(dataset))
+
+# Add the random labels to the dataset
+dataset = dataset.add_column("label", random_labels)
+
+# Print distribution of labels
+print("\nLabel distribution:")
+print(f"Number of 0s: {sum(random_labels == 0)}")
+print(f"Number of 1s: {sum(random_labels == 1)}")
+
+model_name = "answerdotai/ModernBERT-base"
+
+# Check if GPU is available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModel.from_pretrained(model_name).to(device)
+
+def get_embeddings(text):
+    # Tokenize and prepare input
+    inputs = tokenizer(text, padding=True, truncation=True, return_tensors="pt", max_length=512)
+    
+    # Move inputs to GPU if available
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # Get model outputs
+    with torch.no_grad():
+        outputs = model(**inputs)
+    
+    # Use CLS token embedding (first token) and move back to CPU for numpy conversion
+    embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+    return embeddings[0]
+
+# Create embeddings for the anchor column
+dataset = dataset.map(
+    lambda x: {"embeddings": get_embeddings(x["anchor"])},
+)
+
+# You can verify the new column exists and see the first few examples
+print(dataset.column_names)  # Should show 'embeddings' in the list
+print(dataset['embeddings'][0])  # Print first embedding vector
+
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+class EmbeddingDataset(Dataset):
+    def __init__(self, embeddings, labels):
+        self.embeddings = torch.FloatTensor(embeddings)
+        self.labels = torch.LongTensor(labels)
+    
+    def __len__(self):
+        return len(self.embeddings)
+    
+    def __getitem__(self, idx):
+        return self.embeddings[idx], self.labels[idx]
+
+# Define the model architecture
+class TextClassifier(nn.Module):
+    def __init__(self, embedding_dim, hidden_dim, lstm_layers, num_classes):
+        super(TextClassifier, self).__init__()
+        
+        self.dense1 = nn.Linear(embedding_dim, hidden_dim)
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=lstm_layers, 
+                           batch_first=True)
+        self.dense2 = nn.Linear(hidden_dim, num_classes)
+        self.dropout = nn.Dropout(0.2)
+        self.relu = nn.ReLU()
+        
+    def forward(self, x):
+        # First dense layer
+        x = self.dense1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        
+        # Reshape for LSTM: add sequence length dimension of 1
+        x = x.unsqueeze(1)
+        
+        # LSTM layer
+        lstm_out, _ = self.lstm(x)
+        
+        # Take the output from the last time step
+        lstm_out = lstm_out[:, -1, :]
+        
+        # Final dense layer with softmax
+        x = self.dense2(lstm_out)
+        return torch.softmax(x, dim=1)
+
+# Prepare the data
+embeddings_array = np.array(dataset['embeddings'])
+labels = np.array(dataset['label'])
+
+# Create train dataset and dataloader
+train_dataset = EmbeddingDataset(embeddings_array, labels)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+
+# Initialize model and move to GPU if available
+embedding_dim = embeddings_array.shape[1]  # Dimension of your embeddings
+hidden_dim = 128  # You can adjust this
+lstm_layers = 2   # Number of LSTM layers
+num_classes = 2   # Binary classification (0 or 1)
+
+model = TextClassifier(embedding_dim, hidden_dim, lstm_layers, num_classes).to(device)
+
+# Define loss function and optimizer
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# Training loop
+num_epochs = 10
+
+print("\nStarting training...")
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    for batch_embeddings, batch_labels in train_loader:
+        # Move batch to device
+        batch_embeddings = batch_embeddings.to(device)
+        batch_labels = batch_labels.to(device)
+        
+        # Forward pass
+        optimizer.zero_grad()
+        outputs = model(batch_embeddings)
+        
+        # Calculate loss
+        loss = criterion(outputs, batch_labels)
+        
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+        
+        # Track statistics
+        total_loss += loss.item()
+        _, predicted = torch.max(outputs.data, 1)
+        total += batch_labels.size(0)
+        correct += (predicted == batch_labels).sum().item()
+    
+    # Print epoch statistics
+    avg_loss = total_loss / len(train_loader)
+    accuracy = 100 * correct / total
+    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%')
+
+print("Training finished!")
+
+# Make predictions on the entire dataset
+model.eval()
+with torch.no_grad():
+    test_embeddings = torch.FloatTensor(embeddings_array).to(device)
+    predictions = model(test_embeddings)
+    _, predicted_labels = torch.max(predictions, 1)
+    predicted_labels = predicted_labels.cpu().numpy()
+
+# Add predictions to dataset
+dataset = dataset.add_column("predicted_label", predicted_labels)
+
+# Print final evaluation
+print("\nFinal Evaluation:")
+accuracy = (predicted_labels == labels).mean() * 100
+print(f"Overall Accuracy: {accuracy:.2f}%")
+print("\nSample predictions:")
+for i in range(5):
+    print(f"True label: {labels[i]}, Predicted: {predicted_labels[i]}")
+
+
